@@ -1,0 +1,3 @@
+/target
+.vite/
+.claude/settings.local.json
