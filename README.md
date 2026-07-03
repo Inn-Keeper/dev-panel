@@ -132,11 +132,5 @@ system — just nothing you can `S`tart, since there's nothing configured to sta
 | Esc | Cancel pending action / close pane / clear filter |
 | PgUp / PgDn | Scroll log pane |
 | q | Quit |
-
-## Portfolio framing
-
-A secondary/side-interest project rather than a lead piece — day-job targets are
-Product Engineer / Senior Frontend-Fullstack roles, so this isn't a direct proof point
-for that stack. It's a signal of range: OS-level curiosity, and picking up a new
 language fast against a problem with real edge cases (the naive-vs-systemd restart
 tradeoff above is one of them).
