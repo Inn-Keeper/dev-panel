@@ -42,15 +42,15 @@ fn status_style(status: &str) -> Style {
     }
 }
 
-/// Width of the trailing "↻" restart column, click target for the mouse handler.
-pub const RESTART_COL_WIDTH: u16 = 8;
+/// Width of the trailing restart-strategy column, click target for the mouse handler.
+pub const RESTART_COL_WIDTH: u16 = 10;
 
 fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
     let rows = app.rows.iter().map(|r| {
         TableRow::new(vec![
             Line::from(r.port.map(|p| p.to_string()).unwrap_or_else(|| "-".into())),
             Line::from(r.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())),
-            Line::from(r.name.clone()),
+            Line::from(r.display_name.clone()),
             Line::from(r.status.clone()).style(status_style(&r.status)),
             Line::from(r.user.clone()),
             Line::from(if r.cmd.is_empty() {
@@ -58,7 +58,7 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 r.cmd.clone()
             }),
-            Line::from("  ↻").style(Style::new().cyan()),
+            Line::from(format!("↻ {}", r.restart_label)).style(restart_style(&r.restart_label)),
         ])
     });
     let title = if app.filter.is_empty() {
@@ -90,6 +90,15 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
     app.table_area = area;
 }
 
+fn restart_style(label: &str) -> Style {
+    match label {
+        "managed" | "configured" | "systemd" | "launchd" | "docker" => Style::new().fg(Color::Green),
+        "shell" | "naive" => Style::new().fg(Color::Yellow),
+        "unknown" => Style::new().fg(Color::Red),
+        _ => Style::new().cyan(),
+    }
+}
+
 fn draw_pane(f: &mut Frame, app: &mut App, area: Rect) {
     match app.pane {
         Some(Pane::Logs) => draw_logs(f, app, area),
@@ -104,11 +113,25 @@ fn draw_pane(f: &mut Frame, app: &mut App, area: Rect) {
         Some(Pane::Details) => {
             let title = format!(
                 " details for selected row: {} (pane below table, not inline) ",
-                app.selected_row().map(|r| r.name.as_str()).unwrap_or("-")
+                app.selected_row()
+                    .map(|r| r.display_name.as_str())
+                    .unwrap_or("-")
             );
             let text = app.details_lines().join("\n");
             f.render_widget(
                 Paragraph::new(text).block(Block::bordered().title(title)),
+                area,
+            );
+        }
+        Some(Pane::Events) => {
+            let lines = app.event_lines();
+            let text = if lines.is_empty() {
+                "no events yet".to_string()
+            } else {
+                lines.join("\n")
+            };
+            f.render_widget(
+                Paragraph::new(text).block(Block::bordered().title(" events (recent actions) ")),
                 area,
             );
         }
@@ -165,7 +188,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Line::from(format!(" /{}▌  Enter apply · Esc clear", app.filter)).bold()
     } else {
         Line::from(format!(
-            " {}  |  k kill  r/click↻ restart  s/S start  l logs  d details (below)  u cpu  v env  o open  c/C copy  e edit  / filter  q quit",
+            " {}  |  k kill  r/click↻ restart  R stack-restart  K stack-stop  a adopt  s/S start-stack  l logs  m events  d details  u cpu  v env  o open  c/C copy  e edit  / filter  q quit",
             app.message
         ))
     };
@@ -173,14 +196,18 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_modal(f: &mut Frame, app: &App) {
-    let Some(text) = app.describe_pending() else {
+    let Some(lines) = app.pending_lines() else {
         return;
     };
-    let area = centered(f.area(), 60, 3);
+    let height = (lines.len() as u16 + 3).min(f.area().height.saturating_sub(4));
+    let width = 72u16.min(f.area().width.saturating_sub(4));
+    let area = centered(f.area(), width, height);
     f.render_widget(Clear, area);
+    let mut text: Vec<Line> = lines.into_iter().map(Line::from).collect();
+    text.push(Line::from(""));
+    text.push(Line::from("y = confirm · a = adopt (restart) · Esc = cancel").dim());
     f.render_widget(
-        Paragraph::new(format!("{text}  y = confirm, Esc = cancel"))
-            .block(Block::bordered().title(" Confirm ")),
+        Paragraph::new(text).block(Block::bordered().title(" Confirm ")),
         area,
     );
 }

@@ -17,6 +17,7 @@ pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const KILL_ESCALATE_AFTER: Duration = Duration::from_secs(3);
 const RESPAWN_GIVE_UP: Duration = Duration::from_secs(15);
 const CPU_HISTORY: usize = 60;
+const EVENT_CAP: usize = 200;
 /// Table border (1) + header row (1) above the first data row.
 const TABLE_HEADER_ROWS: u16 = 2;
 
@@ -26,6 +27,35 @@ pub enum Pane {
     Usage,
     EnvDiff,
     Details,
+    Events,
+}
+
+/// How a row will be restarted — shown in the table and confirm modal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RestartStrategy {
+    Managed,
+    Configured,
+    Systemd,
+    Launchd,
+    Docker,
+    Shell,
+    Naive,
+    Unknown,
+}
+
+impl RestartStrategy {
+    pub fn label(self) -> &'static str {
+        match self {
+            RestartStrategy::Managed => "managed",
+            RestartStrategy::Configured => "configured",
+            RestartStrategy::Systemd => "systemd",
+            RestartStrategy::Launchd => "launchd",
+            RestartStrategy::Docker => "docker",
+            RestartStrategy::Shell => "shell",
+            RestartStrategy::Naive => "naive",
+            RestartStrategy::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -44,6 +74,10 @@ pub struct Row {
     pub status: String,
     pub user: String,
     pub cmd: String,
+    /// Display name with kind badge, e.g. "[ext] node".
+    pub display_name: String,
+    /// Short restart strategy label for the ↻ column.
+    pub restart_label: String,
 }
 
 pub enum Pending {
@@ -58,6 +92,8 @@ pub enum Pending {
         cwd: Option<PathBuf>,
         /// systemd unit (Linux only) — restart via systemctl instead.
         unit: Option<String>,
+        /// launchd label (macOS only) — restart via launchctl kickstart.
+        launchd: Option<String>,
     },
     ServiceStop(usize),
     ServiceRestart(usize),
@@ -69,12 +105,32 @@ pub enum Pending {
         id: String,
         name: String,
     },
+    /// Kill an external process, then start the matching configured service.
+    ServiceTakeover {
+        service_i: usize,
+        pid: i32,
+        name: String,
+    },
+    /// Save an external process as a managed service in dev-panel.toml.
+    Adopt {
+        cfg: services::ServiceConfig,
+    },
+    StackRestart,
+    StackStop,
 }
 
 struct Respawn {
     pid: i32,
     cmd: Vec<String>,
     cwd: Option<PathBuf>,
+    /// Run through the platform shell (sh -c) instead of direct exec.
+    via_shell: bool,
+    since: Instant,
+}
+
+struct Takeover {
+    service_i: usize,
+    pid: i32,
     since: Instant,
 }
 
@@ -106,11 +162,13 @@ pub struct App {
     pub pending: Option<Pending>,
     term_sent: Vec<(i32, Instant)>,
     respawns: Vec<Respawn>,
+    takeovers: Vec<Takeover>,
     respawn_watches: Vec<RespawnWatch>,
     /// docker stop/restart run on a background thread — the CLI call can
     /// take up to the stop timeout, and this is an interactive TUI.
     docker_ops: Vec<Receiver<String>>,
     pub cpu_hist: HashMap<i32, VecDeque<u64>>,
+    pub events: VecDeque<String>,
     pub message: String,
     warned_conflicts: bool,
 }
@@ -134,9 +192,11 @@ impl App {
             pending: None,
             term_sent: Vec::new(),
             respawns: Vec::new(),
+            takeovers: Vec::new(),
             respawn_watches: Vec::new(),
             docker_ops: Vec::new(),
             cpu_hist: HashMap::new(),
+            events: VecDeque::new(),
             message: "ready".into(),
             warned_conflicts: false,
         }
@@ -165,6 +225,7 @@ impl App {
         }
         self.watch_kills();
         self.watch_respawns();
+        self.watch_takeovers();
         self.build_rows();
         self.warn_conflicts_once();
     }
@@ -212,6 +273,7 @@ impl App {
                     .cfg
                     .port
                     .is_some_and(|p| self.external.iter().any(|e| e.port == p));
+            let strategy = RestartStrategy::Managed;
             rows.push(Row {
                 kind: RowKind::Service(i),
                 port: svc.cfg.port,
@@ -220,16 +282,19 @@ impl App {
                 status: if occupied {
                     "conflict".into()
                 } else {
-                    svc.status.label().into()
+                    svc.status_display()
                 },
                 user: "-".into(),
                 cmd: svc.cfg.cmd.clone(),
+                display_name: format!("[svc] {}", svc.cfg.name),
+                restart_label: strategy.label().into(),
             });
         }
         for e in &self.external {
             if managed_pids.contains(&e.pid) || managed_ports.contains(&e.port) {
                 continue;
             }
+            let strategy = self.external_restart_strategy(e.port, e.pid);
             rows.push(Row {
                 kind: RowKind::Process,
                 port: Some(e.port),
@@ -238,6 +303,8 @@ impl App {
                 status: "listen".into(),
                 user: e.user.clone(),
                 cmd: e.cmd.clone(),
+                display_name: format!("[ext] {}", e.name),
+                restart_label: strategy.label().into(),
             });
         }
         for c in &self.containers {
@@ -249,6 +316,8 @@ impl App {
                 status: c.status.clone(),
                 user: "docker".into(),
                 cmd: format!("{}  {}", c.image, c.ports),
+                display_name: format!("[docker] {}", c.name),
+                restart_label: RestartStrategy::Docker.label().into(),
             });
         }
         if !self.filter.is_empty() {
@@ -271,6 +340,61 @@ impl App {
             _ => {}
         }
         self.track_cpu();
+    }
+
+    fn external_restart_strategy(&self, port: u16, pid: i32) -> RestartStrategy {
+        if self.manager.find_by_port(port).is_some() {
+            return RestartStrategy::Configured;
+        }
+        if platform::systemd_unit(pid).is_some() {
+            return RestartStrategy::Systemd;
+        }
+        if platform::launchd_label(pid).is_some() {
+            return RestartStrategy::Launchd;
+        }
+        let proc = self.system.process(sysinfo::Pid::from(pid as usize));
+        let cmd = proc
+            .map(|p| command_line(p, pid))
+            .unwrap_or_default();
+        if cmd.is_empty() {
+            RestartStrategy::Unknown
+        } else if should_respawn_via_shell(&cmd) {
+            RestartStrategy::Shell
+        } else {
+            RestartStrategy::Naive
+        }
+    }
+
+    pub fn push_event(&mut self, msg: impl Into<String>) {
+        let msg = msg.into();
+        self.message = msg.clone();
+        if self.events.len() >= EVENT_CAP {
+            self.events.pop_front();
+        }
+        self.events.push_back(msg);
+    }
+
+    fn watch_takeovers(&mut self) {
+        let mut keep = Vec::new();
+        for t in std::mem::take(&mut self.takeovers) {
+            if self.alive(t.pid) {
+                if t.since.elapsed() >= RESPAWN_GIVE_UP {
+                    self.push_event(format!(
+                        "{} won't exit; configured restart abandoned",
+                        t.pid
+                    ));
+                } else {
+                    keep.push(t);
+                }
+                continue;
+            }
+            let name = self.manager.services[t.service_i].cfg.name.clone();
+            match self.manager.start(t.service_i) {
+                Ok(()) => self.push_event(format!("started configured service {name}")),
+                Err(e) => self.push_event(format!("start {name} failed: {e}")),
+            }
+        }
+        self.takeovers = keep;
     }
 
     fn track_cpu(&mut self) {
@@ -303,7 +427,7 @@ impl App {
             .map(|r| format!("{} (port {})", r.name, r.port.unwrap_or(0)))
             .collect();
         if !conflicts.is_empty() {
-            self.message = format!("port conflict: {}", conflicts.join(", "));
+            self.push_event(format!("port conflict: {}", conflicts.join(", ")));
         }
     }
 
@@ -311,11 +435,11 @@ impl App {
         let mut keep = Vec::new();
         for (pid, when) in std::mem::take(&mut self.term_sent) {
             if !self.alive(pid) {
-                self.message = format!("{pid} exited after SIGTERM");
+                self.push_event(format!("{pid} exited after SIGTERM"));
             } else if when.elapsed() >= KILL_ESCALATE_AFTER {
                 match platform::force_kill(pid) {
-                    Ok(()) => self.message = format!("SIGKILL → {pid} (ignored SIGTERM)"),
-                    Err(e) => self.message = format!("SIGKILL {pid} failed: {e}"),
+                    Ok(()) => self.push_event(format!("SIGKILL → {pid} (ignored SIGTERM)")),
+                    Err(e) => self.push_event(format!("SIGKILL {pid} failed: {e}")),
                 }
             } else {
                 keep.push((pid, when));
@@ -331,30 +455,37 @@ impl App {
         for r in std::mem::take(&mut self.respawns) {
             if self.alive(r.pid) {
                 if r.since.elapsed() >= RESPAWN_GIVE_UP {
-                    self.message = format!("{} won't exit; respawn abandoned", r.pid);
+                    self.push_event(format!("{} won't exit; respawn abandoned", r.pid));
                 } else {
                     keep.push(r);
                 }
                 continue;
             }
-            let mut cmd = std::process::Command::new(&r.cmd[0]);
-            cmd.args(&r.cmd[1..])
+            let mut child_cmd = if r.via_shell {
+                let cmd_str = r.cmd.join(" ");
+                platform::shell(&cmd_str, r.cwd.as_deref())
+            } else {
+                let mut cmd = std::process::Command::new(&r.cmd[0]);
+                cmd.args(&r.cmd[1..]);
+                if let Some(d) = &r.cwd {
+                    cmd.current_dir(d);
+                }
+                cmd
+            };
+            child_cmd
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::piped());
-            if let Some(d) = &r.cwd {
-                cmd.current_dir(d);
-            }
-            match cmd.spawn() {
+            match child_cmd.spawn() {
                 Ok(child) => {
-                    self.message = format!("respawned as {}", child.id());
+                    self.push_event(format!("respawned as {}", child.id()));
                     self.respawn_watches.push(RespawnWatch {
                         child,
                         cmd: r.cmd,
                         since: Instant::now(),
                     });
                 }
-                Err(e) => self.message = format!("respawn failed: {e}"),
+                Err(e) => self.push_event(format!("respawn failed: {e}")),
             }
         }
         self.respawns = keep;
@@ -379,8 +510,8 @@ impl App {
                             buf.trim().to_string()
                         })
                         .unwrap_or_default();
-                    self.message = format!(
-                        "respawn of {} exited immediately ({status}): {}. Naive restart runs outside the original shell/wrapper env — consider making it a managed service in {} instead.",
+                    self.push_event(format!(
+                        "respawn of {} exited immediately ({status}): {}. Adopt with `a` or define in {} for reliable restarts.",
                         w.cmd.join(" "),
                         if stderr.is_empty() {
                             "no output".into()
@@ -388,7 +519,7 @@ impl App {
                             stderr
                         },
                         services::CONFIG_FILE
-                    );
+                    ));
                 }
                 Ok(None) if w.since.elapsed() < RESPAWN_CRASH_WINDOW => keep.push(w),
                 _ => {} // survived the crash window, or wait() failed: stop watching
@@ -413,7 +544,7 @@ impl App {
         let mut keep = Vec::new();
         for rx in std::mem::take(&mut self.docker_ops) {
             match rx.try_recv() {
-                Ok(msg) => self.message = msg,
+                Ok(msg) => self.push_event(msg),
                 Err(std::sync::mpsc::TryRecvError::Empty) => keep.push(rx),
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
             }
@@ -453,26 +584,120 @@ impl App {
         None
     }
 
-    pub fn describe_pending(&self) -> Option<String> {
-        Some(match self.pending.as_ref()? {
-            Pending::Kill { pid, name } => format!("Kill {pid} ({name})?"),
+    pub fn pending_lines(&self) -> Option<Vec<String>> {
+        let pending = self.pending.as_ref()?;
+        Some(match pending {
+            Pending::Kill { pid, name } => vec![format!("Kill {pid} ({name})?")],
             Pending::Restart {
                 pid,
                 name,
                 unit: Some(u),
                 ..
+            } => vec![
+                format!("Restart {name} ({pid})"),
+                format!("  strategy: systemd → systemctl restart {u}"),
+            ],
+            Pending::Restart {
+                pid,
+                name,
+                launchd: Some(label),
+                ..
+            } => vec![
+                format!("Restart {name} ({pid})"),
+                format!("  strategy: launchd → launchctl kickstart -k {label}"),
+            ],
+            Pending::Restart {
+                pid,
+                name,
+                cmd,
+                cwd,
+                unit: None,
+                launchd: None,
             } => {
-                format!("Restart {name} ({pid}) via systemctl restart {u}?")
+                let cmd_line = if cmd.is_empty() {
+                    "-".into()
+                } else {
+                    cmd.join(" ")
+                };
+                let cwd_line = cwd
+                    .as_ref()
+                    .map(|c| c.display().to_string())
+                    .unwrap_or_else(|| "-".into());
+                vec![
+                    format!("Restart {name} ({pid})"),
+                    if should_respawn_via_shell(cmd) {
+                        "  strategy: shell-wrapped respawn (sh -c)".into()
+                    } else {
+                        "  strategy: direct exec respawn".into()
+                    },
+                    format!("  cmd: {cmd_line}"),
+                    format!("  cwd: {cwd_line}"),
+                    "  logs: none (external process)".into(),
+                    "  tip: press `a` to adopt as a managed service".into(),
+                ]
             }
-            Pending::Restart { pid, name, .. } => format!("Restart {pid} ({name})?"),
             Pending::ServiceStop(i) => {
-                format!("Stop service {}?", self.manager.services[*i].cfg.name)
+                vec![format!(
+                    "Stop service {}?",
+                    self.manager.services[*i].cfg.name
+                )]
             }
             Pending::ServiceRestart(i) => {
-                format!("Restart service {}?", self.manager.services[*i].cfg.name)
+                let name = self.manager.services[*i].cfg.name.clone();
+                let cmd = self.manager.services[*i].cfg.cmd.clone();
+                vec![
+                    format!("Restart service {name}?"),
+                    "  strategy: managed (shell spawn + logs)".into(),
+                    format!("  cmd: {cmd}"),
+                ]
             }
-            Pending::ContainerStop { name, .. } => format!("Stop container {name}?"),
-            Pending::ContainerRestart { name, .. } => format!("Restart container {name}?"),
+            Pending::ServiceTakeover {
+                service_i,
+                pid,
+                name,
+            } => {
+                let svc = &self.manager.services[*service_i];
+                vec![
+                    format!("Restart {name} ({pid}) via configured service"),
+                    "  strategy: kill external → start managed".into(),
+                    format!("  service: {}", svc.cfg.name),
+                    format!("  cmd: {}", svc.cfg.cmd),
+                ]
+            }
+            Pending::ContainerStop { name, .. } => vec![format!("Stop container {name}?")],
+            Pending::ContainerRestart { name, .. } => vec![
+                format!("Restart container {name}?"),
+                "  strategy: docker restart".into(),
+            ],
+            Pending::Adopt { cfg } => {
+                let mut lines = vec![
+                    format!("Adopt as managed service {:?}?", cfg.name),
+                    format!("  cmd: {}", cfg.cmd),
+                ];
+                if let Some(cwd) = &cfg.cwd {
+                    lines.push(format!("  cwd: {cwd}"));
+                }
+                if let Some(port) = cfg.port {
+                    lines.push(format!("  port: {port}"));
+                }
+                lines.push(format!("  saves to {}", services::CONFIG_FILE));
+                lines
+            }
+            Pending::StackRestart => {
+                let names = self.manager.stack_names().join(", ");
+                vec![
+                    "Restart entire stack?".into(),
+                    format!("  order: {names}"),
+                    "  strategy: managed (shell spawn + logs)".into(),
+                ]
+            }
+            Pending::StackStop => {
+                let names = self.manager.stack_names().join(", ");
+                vec![
+                    "Stop entire stack?".into(),
+                    format!("  order (reverse): {names}"),
+                ]
+            }
         })
     }
 
@@ -503,16 +728,20 @@ impl App {
             KeyCode::Char('u') => self.toggle_pane(Pane::Usage),
             KeyCode::Char('v') => self.toggle_pane(Pane::EnvDiff),
             KeyCode::Char('d') => self.toggle_pane(Pane::Details),
+            KeyCode::Char('m') => self.toggle_pane(Pane::Events),
             KeyCode::PageUp => self.log_scroll += 5,
             KeyCode::PageDown => self.log_scroll = self.log_scroll.saturating_sub(5),
             KeyCode::Char('k') => self.request_kill(),
             KeyCode::Char('r') => self.request_restart(),
+            KeyCode::Char('R') => self.request_stack_restart(),
+            KeyCode::Char('a') => self.request_adopt(),
             KeyCode::Char('s') => self.start_selected(),
             KeyCode::Char('S') => self.start_all(),
+            KeyCode::Char('K') => self.request_stack_stop(),
             KeyCode::Char('y') => self.confirm_pending(),
             KeyCode::Esc => {
                 if self.pending.take().is_some() {
-                    self.message = "cancelled".into();
+                    self.push_event("cancelled");
                 } else if self.pane.take().is_none() {
                     self.filter.clear();
                     self.build_rows();
@@ -605,10 +834,26 @@ impl App {
             }
             RowKind::Process => {
                 if let Some(reason) = self.kill_guard(&row) {
-                    self.message = reason;
+                    self.push_event(reason);
                     return;
                 }
                 let pid = row.pid.expect("guard checked pid");
+                let port = row.port.expect("external process has port");
+
+                // Port matches a configured service — kill external, start managed.
+                if let Some(i) = self.manager.find_by_port(port) {
+                    if self.manager.services[i].running() {
+                        self.pending = Some(Pending::ServiceRestart(i));
+                    } else {
+                        self.pending = Some(Pending::ServiceTakeover {
+                            service_i: i,
+                            pid,
+                            name: row.name.clone(),
+                        });
+                    }
+                    return;
+                }
+
                 let proc = self.system.process(sysinfo::Pid::from(pid as usize));
                 let cmd = proc.map(|p| command_line(p, pid)).unwrap_or_default();
                 let cwd = proc
@@ -616,8 +861,9 @@ impl App {
                     .map(PathBuf::from)
                     .or_else(|| platform::lsof_cwd(pid));
                 let unit = platform::systemd_unit(pid);
-                if unit.is_none() && cmd.is_empty() {
-                    self.message = "no command line captured; can't restart".into();
+                let launchd = platform::launchd_label(pid);
+                if unit.is_none() && launchd.is_none() && cmd.is_empty() {
+                    self.push_event("no command line captured; can't restart — try `a` to adopt");
                     return;
                 }
                 self.pending = Some(Pending::Restart {
@@ -626,9 +872,55 @@ impl App {
                     cmd,
                     cwd,
                     unit,
+                    launchd,
                 });
             }
         }
+    }
+
+    fn request_adopt(&mut self) {
+        if let Some(Pending::Restart {
+            name,
+            cmd,
+            cwd,
+            unit: None,
+            launchd: None,
+            ..
+        }) = self.pending.take()
+        {
+            let port = self.selected_row().and_then(|r| r.port);
+            self.pending = Some(Pending::Adopt {
+                cfg: adopt_config_from_process(&name, &cmd.join(" "), cwd.as_deref(), port),
+            });
+            return;
+        }
+
+        let Some(row) = self.selected_row().cloned() else {
+            return;
+        };
+        let RowKind::Process = row.kind else {
+            self.push_event("adopt works on external processes only");
+            return;
+        };
+        let pid = row.pid.expect("external has pid");
+        let proc = self.system.process(sysinfo::Pid::from(pid as usize));
+        let cmd = proc.map(|p| command_line(p, pid)).unwrap_or_default();
+        let cwd = proc
+            .and_then(|p| p.cwd())
+            .map(PathBuf::from)
+            .or_else(|| platform::lsof_cwd(pid));
+        if cmd.is_empty() && row.cmd.is_empty() {
+            self.push_event("no command line captured; can't adopt");
+            return;
+        }
+        let cmd_str = if row.cmd.is_empty() {
+            cmd.join(" ")
+        } else {
+            row.cmd.clone()
+        };
+        self.pending = Some(Pending::Adopt {
+            cfg: adopt_config_from_process(&row.name, &cmd_str, cwd.as_deref(), row.port),
+        });
     }
 
     fn confirm_pending(&mut self) {
@@ -638,10 +930,10 @@ impl App {
         match pending {
             Pending::Kill { pid, name } => match platform::terminate(pid) {
                 Ok(()) => {
-                    self.message = format!("SIGTERM → {pid} ({name})");
+                    self.push_event(format!("SIGTERM → {pid} ({name})"));
                     self.term_sent.push((pid, Instant::now()));
                 }
-                Err(e) => self.message = format!("SIGTERM {pid} failed: {e}"),
+                Err(e) => self.push_event(format!("SIGTERM {pid} failed: {e}")),
             },
             Pending::Restart {
                 pid,
@@ -649,53 +941,120 @@ impl App {
                 cmd,
                 cwd,
                 unit,
+                launchd,
             } => {
                 if let Some(unit) = unit {
-                    self.message = match platform::systemctl_restart(&unit) {
+                    self.push_event(match platform::systemctl_restart(&unit) {
                         Ok(()) => format!("systemctl restarted {unit}"),
                         Err(e) => format!("systemctl restart {unit} failed: {e}"),
-                    };
+                    });
+                } else if let Some(label) = launchd {
+                    self.push_event(match platform::launchctl_restart(&label) {
+                        Ok(()) => format!("launchctl restarted {label}"),
+                        Err(e) => format!("launchctl restart {label} failed: {e}"),
+                    });
                 } else {
                     match platform::terminate(pid) {
                         Ok(()) => {
-                            self.message = format!("restarting {name}: SIGTERM → {pid}");
+                            self.push_event(format!("restarting {name}: SIGTERM → {pid}"));
                             self.term_sent.push((pid, Instant::now()));
+                            let via_shell = should_respawn_via_shell(&cmd);
                             self.respawns.push(Respawn {
                                 pid,
                                 cmd,
                                 cwd,
+                                via_shell,
                                 since: Instant::now(),
                             });
                         }
-                        Err(e) => self.message = format!("SIGTERM {pid} failed: {e}"),
+                        Err(e) => self.push_event(format!("SIGTERM {pid} failed: {e}")),
                     }
                 }
             }
+            Pending::ServiceTakeover {
+                service_i,
+                pid,
+                name,
+            } => match platform::terminate(pid) {
+                Ok(()) => {
+                    self.push_event(format!("restarting {name} via configured service"));
+                    self.term_sent.push((pid, Instant::now()));
+                    self.takeovers.push(Takeover {
+                        service_i,
+                        pid,
+                        since: Instant::now(),
+                    });
+                }
+                Err(e) => self.push_event(format!("SIGTERM {pid} failed: {e}")),
+            },
+            Pending::Adopt { cfg } => match self.manager.adopt(cfg.clone()) {
+                Ok(i) => {
+                    self.push_event(format!(
+                        "adopted {} into {} — press s to take over with managed logs",
+                        cfg.name, services::CONFIG_FILE
+                    ));
+                    self.build_rows();
+                    let _ = i;
+                }
+                Err(e) => self.push_event(format!("adopt failed: {e}")),
+            },
             Pending::ServiceStop(i) => {
                 self.manager.stop(i);
-                self.message = format!("stopping {}", self.manager.services[i].cfg.name);
+                self.push_event(format!("stopping {}", self.manager.services[i].cfg.name));
             }
             Pending::ServiceRestart(i) => {
-                self.message = match self.manager.restart(i) {
-                    Ok(()) => format!("restarting {}", self.manager.services[i].cfg.name),
+                let name = self.manager.services[i].cfg.name.clone();
+                let msg = match self.manager.restart(i) {
+                    Ok(()) => format!("restarting {name}"),
                     Err(e) => format!("restart failed: {e}"),
                 };
+                self.push_event(msg);
             }
             Pending::ContainerStop { id, name } => {
-                self.message = format!("stopping container {name}…");
+                self.push_event(format!("stopping container {name}…"));
                 self.spawn_docker_op(move || match docker::stop(&id) {
                     Ok(()) => format!("stopped container {name}"),
                     Err(e) => format!("docker stop {name} failed: {e}"),
                 });
             }
             Pending::ContainerRestart { id, name } => {
-                self.message = format!("restarting container {name}…");
+                self.push_event(format!("restarting container {name}…"));
                 self.spawn_docker_op(move || match docker::restart(&id) {
                     Ok(()) => format!("restarted container {name}"),
                     Err(e) => format!("docker restart {name} failed: {e}"),
                 });
             }
+            Pending::StackRestart => match self.manager.restart_stack() {
+                Ok(n) => self.push_event(format!("restarting stack ({n} service(s))")),
+                Err(e) => self.push_event(format!("stack restart failed: {e}")),
+            },
+            Pending::StackStop => {
+                self.manager.stop_stack();
+                self.push_event("stopping stack (reverse order)");
+            }
         }
+        self.build_rows();
+    }
+
+    fn request_stack_restart(&mut self) {
+        if self.manager.services.is_empty() {
+            self.push_event(format!("no services configured ({})", services::CONFIG_FILE));
+            return;
+        }
+        self.pending = Some(Pending::StackRestart);
+    }
+
+    fn request_stack_stop(&mut self) {
+        if self.manager.services.is_empty() {
+            self.push_event(format!("no services configured ({})", services::CONFIG_FILE));
+            return;
+        }
+        let any_running = self.manager.services.iter().any(|s| s.running());
+        if !any_running {
+            self.push_event("no managed services running");
+            return;
+        }
+        self.pending = Some(Pending::StackStop);
     }
 
     fn start_selected(&mut self) {
@@ -717,27 +1076,16 @@ impl App {
         self.build_rows();
     }
 
-    /// v2: one keypress starts the whole stack.
+    /// v2: one keypress starts the whole stack (in configured order).
     fn start_all(&mut self) {
         if self.manager.services.is_empty() {
-            self.message = format!("no services configured ({})", services::CONFIG_FILE);
+            self.push_event(format!("no services configured ({})", services::CONFIG_FILE));
             return;
         }
-        let mut started = 0;
-        for i in 0..self.manager.services.len() {
-            if self.manager.services[i].running() {
-                continue;
-            }
-            match self.manager.start(i) {
-                Ok(()) => started += 1,
-                Err(e) => {
-                    self.message =
-                        format!("start {} failed: {e}", self.manager.services[i].cfg.name);
-                    return;
-                }
-            }
+        match self.manager.start_stack() {
+            Ok(started) => self.push_event(format!("started {started} service(s)")),
+            Err(e) => self.push_event(format!("stack start failed: {e}")),
         }
-        self.message = format!("started {started} service(s)");
         self.build_rows();
     }
 
@@ -874,6 +1222,11 @@ impl App {
         ]
     }
 
+    /// Scrollable event history for the events pane.
+    pub fn event_lines(&self) -> Vec<String> {
+        self.events.iter().cloned().collect()
+    }
+
     /// v3 env diffing: what the selected process inherited vs our shell now.
     pub fn env_diff_lines(&self) -> Vec<String> {
         let Some(pid) = self.selected_row().and_then(|r| r.pid) else {
@@ -918,6 +1271,53 @@ fn command_line(p: &sysinfo::Process, pid: i32) -> Vec<String> {
         return cmd;
     }
     platform::ps_cmdline(pid).unwrap_or_default()
+}
+
+fn should_respawn_via_shell(cmd: &[String]) -> bool {
+    cmd.first().is_some_and(|exe| {
+        matches!(
+            exe.as_str(),
+            "npm" | "pnpm" | "yarn" | "npx" | "bun" | "make" | "sh" | "bash" | "zsh"
+        )
+    })
+}
+
+fn adopt_config_from_process(
+    name: &str,
+    cmd: &str,
+    cwd: Option<&std::path::Path>,
+    port: Option<u16>,
+) -> services::ServiceConfig {
+    let cwd = cwd.and_then(|c| {
+        std::env::current_dir().ok().and_then(|here| {
+            c.strip_prefix(&here).ok().map(|p| {
+                if p.as_os_str().is_empty() {
+                    ".".into()
+                } else {
+                    p.display().to_string()
+                }
+            })
+        })
+        .or_else(|| Some(c.display().to_string()))
+    });
+    services::ServiceConfig {
+        name: suggest_service_name(name, port),
+        cmd: cmd.to_string(),
+        cwd,
+        port,
+        auto_restart: false,
+        health_url: None,
+    }
+}
+
+fn suggest_service_name(process_name: &str, port: Option<u16>) -> String {
+    let base = process_name.trim();
+    if !base.is_empty() && base != "-" {
+        base.to_string()
+    } else {
+        port.map(|p| format!("port-{p}"))
+            .unwrap_or_else(|| "service".into())
+    }
 }
 
 fn format_duration(d: Duration) -> String {
@@ -1046,6 +1446,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn adopt_config_uses_port_fallback_name() {
+        let cfg = adopt_config_from_process("", "npm run dev", None, Some(3000));
+        assert_eq!(cfg.name, "port-3000");
+        assert_eq!(cfg.port, Some(3000));
+        assert_eq!(cfg.cmd, "npm run dev");
+    }
+
+    #[test]
+    fn suggest_service_name_prefers_process_name() {
+        let cfg = adopt_config_from_process("vite", "vite", None, Some(5173));
+        assert_eq!(cfg.name, "vite");
+    }
+
     /// End-to-end: a real foreign process (not a managed service) bound to a
     /// real port, discovered via the actual lsof-backed port scan, restarted
     /// through the exact key path the UI drives (r, then y). Reproduces the
@@ -1054,7 +1468,7 @@ mod tests {
     #[test]
     fn restart_of_foreign_process_actually_respawns() {
         use std::io::Read;
-        let port: u16 = 58322;
+        let port: u16 = 42000 + (std::process::id() as u16 % 20000);
         let script = format!("require('http').createServer((q,r)=>r.end('ok')).listen({port});");
         let mut child = std::process::Command::new("node")
             .args(["-e", &script])

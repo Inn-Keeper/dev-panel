@@ -184,8 +184,8 @@ fn pipe_to(cmd: &mut Command, text: &str) -> io::Result<()> {
     }
 }
 
-// Only Windows (taskkill) and Linux (systemctl) callers exist.
-#[cfg(any(windows, target_os = "linux"))]
+// Only Windows (taskkill), Linux (systemctl), and macOS (launchctl) callers exist.
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 fn run_ok(cmd: &mut Command) -> io::Result<()> {
     let out = cmd.output()?;
     if out.status.success() {
@@ -230,6 +230,73 @@ pub fn systemctl_restart(_unit: &str) -> io::Result<()> {
     Err(io::Error::other("systemd restart is Linux-only"))
 }
 
+/// Parse `launchctl list` lines into (pid, label). PID is `-` when not running.
+#[cfg(any(test, target_os = "macos"))]
+pub fn parse_launchctl_list_line(line: &str) -> Option<(Option<i32>, String)> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let mut parts = line.split_whitespace();
+    let pid_str = parts.next()?;
+    let _status = parts.next()?;
+    let label = parts.collect::<Vec<_>>().join(" ");
+    if label.is_empty() {
+        return None;
+    }
+    let pid = if pid_str == "-" {
+        None
+    } else {
+        pid_str.parse().ok()
+    };
+    Some((pid, label))
+}
+
+#[cfg(target_os = "macos")]
+pub fn launchd_label(pid: i32) -> Option<String> {
+    let out = Command::new("launchctl").arg("list").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        let Some((p, label)) = parse_launchctl_list_line(line) else {
+            continue;
+        };
+        if p == Some(pid) {
+            return Some(label);
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn launchd_label(_pid: i32) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+pub fn launchctl_restart(label: &str) -> io::Result<()> {
+    use nix::unistd::getuid;
+    let uid = getuid().as_raw();
+    let targets = [
+        format!("gui/{uid}/{label}"),
+        format!("user/{uid}/{label}"),
+        format!("system/{label}"),
+        label.to_string(),
+    ];
+    let mut last_err = io::Error::other("launchctl kickstart failed");
+    for target in &targets {
+        match run_ok(Command::new("launchctl").args(["kickstart", "-k", target])) {
+            Ok(()) => return Ok(()),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn launchctl_restart(_label: &str) -> io::Result<()> {
+    Err(io::Error::other("launchd restart is macOS-only"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,5 +333,20 @@ mod tests {
         let pid = std::process::id() as i32;
         let cwd = lsof_cwd(pid).expect("lsof should see our own process cwd");
         assert!(cwd.is_absolute());
+    }
+
+    #[test]
+    fn parse_launchctl_list_line_running() {
+        let (pid, label) =
+            parse_launchctl_list_line("1234\t0\tcom.example.myapp").expect("parsed");
+        assert_eq!(pid, Some(1234));
+        assert_eq!(label, "com.example.myapp");
+    }
+
+    #[test]
+    fn parse_launchctl_list_line_stopped() {
+        let (pid, label) = parse_launchctl_list_line("-  0  com.example.agent").expect("parsed");
+        assert_eq!(pid, None);
+        assert_eq!(label, "com.example.agent");
     }
 }

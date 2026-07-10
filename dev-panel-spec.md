@@ -12,40 +12,54 @@ One dashboard replaces five terminals: see every service, its port, its status, 
 
 ## Tech Stack
 
-- **Language**: Rust
+- **Language**: Rust (edition 2024)
 - **TUI framework**: `ratatui` + `crossterm`
 - **Process/system info**: `sysinfo`
-- **Signals**: `nix` (for SIGTERM before SIGKILL)
-- **Docker (stretch)**: `bollard`
+- **Signals**: `nix` (SIGTERM / SIGKILL on Unix)
+- **Config**: `serde` + `toml`
+- **Docker**: shells out to `docker` CLI (no `bollard` / `tokio`)
+- **Health probes**: raw `std::net::TcpStream` HTTP/1.1 GET (no TLS crate)
 - **Port/proc mapping (Linux)**: parse `/proc/net/tcp` + `/proc/net/tcp6`, cross-reference inode numbers against `/proc/<pid>/fd/*`
+- **Port/proc mapping (macOS)**: `lsof -F`
+- **Port/proc mapping (Windows)**: `netstat -ano`
 
 ## Architecture Overview
 
 ```
-AppState {
-    processes: Vec<ProcessInfo>,     // refreshed each poll
-    services: Vec<ServiceConfig>,    // loaded from dev-panel.toml
-    selected: usize,
-    pending_action: Option<Action>,  // Some(Kill(pid)) while awaiting confirm
-    last_message: String,
+App {
+    manager: Manager,           // dev-panel.toml services + lifecycle
+    rows: Vec<Row>,             // managed + external + docker, rebuilt each poll
+    pending: Option<Pending>,  // confirm modal state
+    events: VecDeque<String>,  // persistent action log (m pane)
+    pane: Option<Pane>,       // logs | usage | env | details | events
 }
 ```
 
-Event loop: poll (1–2s interval) → draw → read key event → mutate state directly (navigation) or set `pending_action` (kill/restart) → next frame shows confirm modal → on confirm, execute and clear.
+Event loop: 200ms key/mouse poll → draw → every 2s refresh ports/processes/docker → confirm modal on kill/restart/adopt/stack actions.
 
-## MVP Scope (v1)
+## Implemented Features
 
-1. **Process/port table** — list of open ports, owning PID, process name, command line. `ratatui::widgets::Table` with `TableState` for row selection.
-2. **Kill action** — SIGTERM first, escalate to SIGKILL after timeout (`k` keybinding). Confirmation modal required before executing — irreversible actions need a "press y to confirm" step.
-3. **Restart action** (`r` keybinding) — naive restart: capture original `cmd()`/`cwd()` via `sysinfo`, kill, respawn via `std::process::Command`. Known limitation: breaks for processes launched via wrapper scripts, docker-compose, or systemd units with env vars that matter.
-4. **Log tailing pane** — tail stdout/stderr of managed processes into a scrollable pane, switchable per service. Identified as the single biggest terminal-count reducer.
-5. **Safety guardrails** — blocklist/warning for PID 1, the tool's own parent shell PID, and root-owned processes when not running as root.
+### Process table
 
-## v2 — Named Service Groups
+- Columns: PORT, PID, NAME (with `[svc]` / `[ext]` / `[docker]` badge), STATUS, USER, COMMAND, RESTART (strategy label + ↻)
+- Restart strategy shown per row: `managed`, `configured`, `systemd`, `launchd`, `docker`, `shell`, `naive`, `unknown`
+- Filter with `/`; mouse click ↻ column to restart, elsewhere to select
 
-Project-level config file defining the whole stack, so one keypress starts everything instead of `cd`-ing into multiple terminals.
+### Kill / restart
 
-Example `dev-panel.toml`:
+- **Kill** (`k`): SIGTERM → SIGKILL after 3s; confirmation required
+- **Restart** (`r`): strategy-aware confirm modal with cmd/cwd/strategy preview
+  - Managed services: shell spawn + piped logs
+  - Configured port match: kill external → start managed service
+  - Linux systemd: `systemctl restart <unit>` via `/proc/<pid>/cgroup`
+  - macOS launchd: `launchctl kickstart -k <label>` via `launchctl list`
+  - External fallback: shell-wrapped respawn for npm/pnpm/etc., direct exec for node/python
+- **Adopt** (`a`): save external process as `[[service]]` in `dev-panel.toml`; also
+  available from the restart confirm modal (`r` then `a`)
+- **Configured restart**: if an external process's port matches a `dev-panel.toml`
+  service, `r` kills the external process and starts the managed service instead
+
+### Managed services (`dev-panel.toml`)
 
 ```toml
 [[service]]
@@ -53,6 +67,8 @@ name = "frontend"
 cmd = "npm run dev"
 cwd = "./web"
 port = 3000
+health_url = "http://localhost:3000/health"
+auto_restart = true
 
 [[service]]
 name = "backend"
@@ -60,90 +76,84 @@ cmd = "cargo run"
 cwd = "./api"
 port = 8080
 
-[[service]]
-name = "worker"
-cmd = "npm run worker"
-cwd = "./worker"
+[stack]
+services = ["backend", "frontend"]
 ```
 
-Features on top of this:
-- **Health checks** — HTTP ping to `/health` or root, colored status indicator (up/down/starting)
-- **Port conflict warnings** — flag at startup if a configured port is already owned by something else
-- **Docker container awareness** — list containers alongside plain processes via `bollard`, unifying `docker ps` into the same view
+- **Health**: HTTP GET when `health_url` set (`up (200)`); TCP connect to `port` otherwise (`up (port)`)
+- **Stack**: `S` start in order, `R` restart stack, `K` stop in reverse order
+- Log tailing (`l`), crash detection + backoff auto-restart, session persistence (`.dev-panel-session`)
+- Port conflict warnings when a configured port is occupied externally
+- Session persistence via `.dev-panel-session` (resume on relaunch)
 
-## v3 — Quality of Life
+### Service config fields
 
-- Quick actions: open port in browser (`o`), copy PID/port to clipboard, open project folder in editor
-- Per-service resource sparklines (CPU/mem over time) using ratatui's built-in sparkline widget
-- Session persistence — remember which services were running across tool restarts
-- Crash detection + optional auto-restart with backoff
-- Env var diffing — surface which env vars a process actually inherited, to catch stale-env "works on my machine" bugs
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | yes | Table display name |
+| `cmd` | yes | Shell command |
+| `cwd` | no | Working directory |
+| `port` | no | TCP probe + conflict detection |
+| `health_url` | no | HTTP GET probe (`http://` only, no TLS) |
+| `auto_restart` | no | Backoff auto-restart on crash (default: false) |
 
-## Keybindings (draft)
+### Bottom panes
+
+| Key | Pane |
+|-----|------|
+| `l` | Logs (managed services) |
+| `u` | CPU sparkline |
+| `v` | Env diff (process vs current shell) |
+| `d` | Details (cmd, cwd, uptime, children) |
+| `m` | Event log (recent actions) |
+
+### Docker
+
+Containers listed alongside processes; stop/restart via `docker` CLI on a background thread.
+
+### Safety guardrails
+
+PID 1, dev-panel's own process tree, and root-owned processes (when not root) cannot be killed.
+
+## Keybindings
 
 | Key | Action |
 |-----|--------|
 | ↑ / ↓ | Navigate table |
-| k | Kill selected process (with confirm) |
-| r | Restart selected process (with confirm) |
+| k | Kill / stop selected (with confirm) |
+| r | Restart selected (with confirm; shows strategy) |
+| R | Restart entire stack (with confirm) |
+| K | Stop entire stack in reverse order (with confirm) |
+| a | Adopt external process into `dev-panel.toml` |
+| s | Start selected managed service |
+| S | Start stack |
+| l / u / v / d / m | Toggle panes |
 | o | Open port in browser |
-| / | Filter/search |
-| y | Confirm pending action |
-| Esc | Cancel pending action |
+| c / C | Copy port / PID |
+| e | Open working directory in editor |
+| / | Filter |
+| y | Confirm (`a` switches restart confirm → adopt) |
+| Esc | Cancel / close pane |
+| click ↻ | Restart row |
 | q | Quit |
 
-## Reference Tools (prior art)
+## Known Limitations
 
-- `lsof -i -P -n`, `ss -tulpn`, `netstat -tulpn` — standard Unix port/process inspection
-- `bottom` (btm) — htop-style Rust TUI, architecture reference for ratatui usage
-- `bandwhich` — per-process network utilization in Rust, closest existing analog
-- `procs` — modern Rust `ps` replacement
-
-## Portfolio Framing
-
-Positioned as a secondary/side-interest project rather than a lead piece, given primary job targets are Product Engineer / Senior Frontend-Fullstack roles. Value is as a signal of range, OS-level curiosity, and ability to pick up a new language fast — not a direct proof point for frontend stack depth. README should lead with the *why* (built to solve a real daily annoyance) and can call out the naive-vs-systemd restart tradeoff as evidence of thinking through edge cases.
-
-## Environment Setup
-
-**System-level (one-time):**
-
-1. **Rust toolchain** via rustup (not distro package manager, keeps you on stable and lets you switch toolchains):
-   ```
-   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-   ```
-   Provides `rustc`, `cargo`, `rustup`.
-
-2. **Build essentials** — linker/C toolchain, needed even for pure-Rust projects since some crates compile C shims:
-   ```
-   sudo apt install build-essential pkg-config
-   ```
-   (`base-devel` on Arch, Xcode Command Line Tools on macOS)
-
-3. **Docker CLI** — only needed for container-awareness; dev-panel shells out to `docker ps`/`stop`/`restart` rather than linking `bollard`, so no daemon *library* dependency, just the CLI on `PATH` if you want containers to show up.
-
-**VSCode extensions/components (recommended):**
-
-1. **rust-analyzer** — LSP extension, inline errors/autocomplete/go-to-def
-2. **clippy** — `rustup component add clippy`
-3. **rustfmt** — `rustup component add rustfmt`
-
-**Not needed as separate installs** — `ratatui`, `crossterm`, `sysinfo`, `serde`, `toml` are just `Cargo.toml` entries; Cargo fetches and compiles them on first build. `nix` is a Unix-only target dependency (Windows uses `taskkill`/no crate). No OpenSSL/native-TLS headers needed — health checks are a raw `TcpStream` connect, not an HTTP client crate.
-
-**Sanity check:**
-```
-rustc --version && cargo --version
-```
+- Shell-wrapped / direct-exec restart can fail for wrapper scripts, docker-compose, or env-dependent launches — use **adopt** (`a`) for reliable control
+- `https://` health URLs not supported (no TLS)
+- No integration with external terminal emulators (iTerm, tmux) — port-discovered processes only
+- Windows has no systemd/launchd equivalent
 
 ## Decisions
 
-- **Cross-platform scope**: all three — Linux, macOS, Windows. Only port discovery
-  needed a per-OS backend (`lsof` / `/proc` / `netstat`); everything else in
-  `src/platform.rs` is a thin `#[cfg]` branch (signals, clipboard, editor/browser
-  opener, systemd detection).
-- **Systemd-aware restart**: built now, not deferred to v2/v3. Detects the unit via
-  `/proc/<pid>/cgroup` (Linux only) and restarts with `systemctl restart <unit>`
-  instead of the naive kill+respawn, so systemd-managed env/cwd/restart-policy
-  survives. No equivalent for launchd or Windows services.
-- **Mouse support**: skipped, as originally suggested — keybindings only.
-- **Docker**: shells out to the `docker` CLI rather than adding `bollard` (would drag
-  in `tokio` for an otherwise-sync codebase). See README's Known Limitations.
+- **Cross-platform**: Linux, macOS, Windows — per-OS port discovery in dedicated backends
+- **Supervisor-aware restart**: systemd (Linux) and launchd (macOS) detected and restarted via native tools
+- **Mouse**: supported for row select and ↻ column restart click
+- **Docker**: CLI shell-out, not `bollard`
+- **HTTP health**: minimal HTTP/1.1 over `TcpStream`, not `reqwest`
+
+## Reference Tools (prior art)
+
+- `lsof`, `ss`, `netstat` — port/process inspection
+- `bottom` (btm) — ratatui TUI reference
+- `procs` — modern Rust `ps` replacement
